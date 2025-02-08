@@ -435,19 +435,186 @@ const isKnownMaliciousProcess = (processName) => {
     );
 };
 
+// Add this helper function at the top with other helper functions
+const isKnownService = (port) => {
+    // List of common legitimate service ports
+    const commonPorts = [
+        20, 21,     // FTP
+        22,         // SSH
+        23,         // Telnet
+        25,         // SMTP
+        53,         // DNS
+        80, 443,    // HTTP/HTTPS
+        110,        // POP3
+        143,        // IMAP
+        389,        // LDAP
+        445,        // SMB
+        3306,       // MySQL
+        5432,       // PostgreSQL
+        27017,      // MongoDB
+        6379,       // Redis
+        8080, 8443  // Alternative HTTP/HTTPS
+    ];
+    
+    return commonPorts.includes(Number(port));
+};
+
 // Real-time alerts monitoring
 const getRealTimeAlerts = async () => {
     try {
-        // Integrate with your logging system (e.g., ELK Stack, Splunk)
-        // or security tools (SIEM, IDS/IPS)
-        const alerts = await fetchSecurityAlerts();
-        return alerts.map(alert => ({
-            id: alert.id,
-            type: alert.eventType,
-            severity: alert.severity,
-            source: alert.sourceIP,
-            timestamp: alert.timestamp
-        }));
+        const [
+            processes,
+            networkStats,
+            fsSize,
+            networkConnections
+        ] = await Promise.all([
+            si.processes(),
+            si.networkStats(),
+            si.fsSize(),
+            si.networkConnections()
+        ]);
+
+        // Use an object to track unique alerts by their actual content
+        const uniqueAlerts = new Map();
+
+        // Helper function to add alert with deduplication
+        const addAlert = (key, alert) => {
+            if (!uniqueAlerts.has(key)) {
+                uniqueAlerts.set(key, {
+                    id: `${alert.type.toLowerCase()}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                    ...alert,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        };
+
+        // Check CPU intensive processes
+        if (processes && processes.list) {
+            processes.list.forEach(proc => {
+                if (proc.cpu > 90) {
+                    const key = `CPU_${proc.name}_${proc.pid}`;
+                    addAlert(key, {
+                        type: 'SYSTEM',
+                        severity: 'WARNING',
+                        message: `High CPU usage (${proc.cpu.toFixed(1)}%) by process ${proc.name}`,
+                        source: 'Process Monitor',
+                        details: {
+                            pid: proc.pid,
+                            cpu: proc.cpu,
+                            name: proc.name
+                        }
+                    });
+                }
+                if (proc.memRss > (os.totalmem() * 0.5)) {
+                    const key = `MEM_${proc.name}_${proc.pid}`;
+                    addAlert(key, {
+                        type: 'SYSTEM',
+                        severity: 'WARNING',
+                        message: `High memory usage by process ${proc.name}`,
+                        source: 'Memory Monitor',
+                        details: {
+                            pid: proc.pid,
+                            memory: proc.memRss,
+                            name: proc.name
+                        }
+                    });
+                }
+            });
+        }
+
+        // Check network errors
+        if (networkStats) {
+            networkStats.forEach(stat => {
+                if (stat.rx_errors > 0 || stat.tx_errors > 0) {
+                    const key = `NET_ERR_${stat.iface}`;
+                    addAlert(key, {
+                        type: 'NETWORK',
+                        severity: 'ERROR',
+                        message: `Network errors detected on interface ${stat.iface}`,
+                        source: 'Network Monitor',
+                        details: {
+                            interface: stat.iface,
+                            rxErrors: stat.rx_errors,
+                            txErrors: stat.tx_errors
+                        }
+                    });
+                }
+                if (stat.rx_dropped > 0 || stat.tx_dropped > 0) {
+                    const key = `NET_DROP_${stat.iface}`;
+                    addAlert(key, {
+                        type: 'NETWORK',
+                        severity: 'WARNING',
+                        message: `Dropped packets detected on interface ${stat.iface}`,
+                        source: 'Network Monitor',
+                        details: {
+                            interface: stat.iface,
+                            rxDropped: stat.rx_dropped,
+                            txDropped: stat.tx_dropped
+                        }
+                    });
+                }
+            });
+        }
+
+        // Check disk space
+        if (fsSize) {
+            fsSize.forEach(fs => {
+                if (fs.use > 90) {
+                    const key = `DISK_${fs.mount}`;
+                    addAlert(key, {
+                        type: 'STORAGE',
+                        severity: 'WARNING',
+                        message: `Low disk space on ${fs.mount} (${fs.use}% used)`,
+                        source: 'Storage Monitor',
+                        details: {
+                            mount: fs.mount,
+                            used: fs.used,
+                            size: fs.size,
+                            usage: fs.use
+                        }
+                    });
+                }
+            });
+        }
+
+        // Check suspicious network connections
+        if (networkConnections) {
+            networkConnections.forEach(conn => {
+                if (conn.state === 'LISTEN' && !isKnownService(conn.port)) {
+                    const key = `CONN_${conn.port}_${conn.state}`;
+                    addAlert(key, {
+                        type: 'SECURITY',
+                        severity: 'WARNING',
+                        message: `Suspicious port ${conn.port || 'unknown'} in ${conn.state} state`,
+                        source: 'Security Monitor',
+                        details: {
+                            port: conn.port || 'unknown',
+                            state: conn.state,
+                            process: conn.process || 'unknown',
+                            protocol: conn.protocol || 'unknown'
+                        }
+                    });
+                }
+            });
+        }
+
+        // Convert Map to Array and sort by timestamp
+        const alertsArray = Array.from(uniqueAlerts.values())
+            .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+        return {
+            total: alertsArray.length,
+            critical: alertsArray.filter(alert => alert.severity === 'ERROR').length,
+            warning: alertsArray.filter(alert => alert.severity === 'WARNING').length,
+            categories: {
+                system: alertsArray.filter(alert => alert.type === 'SYSTEM').length,
+                network: alertsArray.filter(alert => alert.type === 'NETWORK').length,
+                security: alertsArray.filter(alert => alert.type === 'SECURITY').length,
+                storage: alertsArray.filter(alert => alert.type === 'STORAGE').length
+            },
+            alerts: alertsArray.slice(0, 10) // Return only the 10 most recent alerts
+        };
+
     } catch (error) {
         console.error('Alerts monitoring error:', error);
         throw error;
@@ -480,6 +647,7 @@ const getThreats = asyncHandler(async (req, res) => {
 
 const getAlerts = asyncHandler(async (req, res) => {
     try {
+        const alertsData = await getRealTimeAlerts();
         return res.status(200).json(
             new ApiResponse(200, alertsData, "Alerts retrieved successfully")
         );
