@@ -72,53 +72,92 @@ const updateSimulatedData = () => {
 // Update data every 30 seconds
 setInterval(updateSimulatedData, 30000);
 
+// Add retry utility function
+const retryOperation = async (operation, retries = 3, delay = 1000) => {
+    for (let i = 0; i < retries; i++) {
+        try {
+            return await operation();
+        } catch (err) {
+            if (i === retries - 1) throw err;
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+};
+
 // Replace the dummy data with real monitoring functions
 const getRealTimeNetworkHealth = async () => {
     try {
+        // Wrap the Promise.all with retry logic and better error handling
         const [
             networkStats,
             latencyCheck,
             networkInterfaces,
             networkConnections
-        ] = await Promise.all([
-            si.networkStats(),
-            si.inetLatency(),
-            si.networkInterfaces(),
-            si.networkConnections()
-        ]);
+        ] = await retryOperation(async () => {
+            try {
+                return await Promise.all([
+                    si.networkStats().catch(err => ({ error: err })),
+                    si.inetLatency().catch(() => 0),  // Default to 0 if latency check fails
+                    si.networkInterfaces().catch(err => ({ error: err })),
+                    si.networkConnections().catch(err => ({ error: err }))
+                ]);
+            } catch (error) {
+                console.error('Network data collection error:', error);
+                // Return default values if all fails
+                return [[], 0, [], []];
+            }
+        });
 
-        // Get active interfaces with proper filtering
-        const activeInterfaces = networkInterfaces.filter(iface => 
-            iface.operstate === 'up' && 
-            !iface.internal &&
-            (iface.ip4 || iface.ip6)
-        );
+        // Safely handle potentially failed network stats
+        const safeNetworkStats = Array.isArray(networkStats) ? networkStats : [];
+        const safeNetworkInterfaces = Array.isArray(networkInterfaces) ? networkInterfaces : [];
 
-        // Get primary interface with more accurate detection
-        const primaryInterface = activeInterfaces.find(iface => 
-            (iface.default || iface.type === 'wired' || iface.type === 'wireless') &&
-            (iface.ip4 || iface.ip6)
-        );
+        // Get active interfaces with proper filtering and error handling
+        const activeInterfaces = safeNetworkInterfaces.filter(iface => {
+            try {
+                return iface && 
+                       iface.operstate === 'up' && 
+                       !iface.internal &&
+                       (iface.ip4 || iface.ip6);
+            } catch (err) {
+                console.warn('Interface filtering error:', err);
+                return false;
+            }
+        });
 
-        // Get corresponding network stats for primary interface
-        const mainInterface = networkStats.find(stat => 
-            stat.iface === primaryInterface?.iface
-        ) || networkStats[0];
-        
-        // Calculate real-time bandwidth usage
+        // Rest of the code remains the same but with added error handling
+        const primaryInterface = activeInterfaces.find(iface => {
+            try {
+                return (iface.default || iface.type === 'wired' || iface.type === 'wireless') &&
+                       (iface.ip4 || iface.ip6);
+            } catch (err) {
+                console.warn('Primary interface detection error:', err);
+                return false;
+            }
+        });
+
+        const mainInterface = safeNetworkStats.find(stat => 
+            stat && stat.iface === primaryInterface?.iface
+        ) || safeNetworkStats[0] || { rx_sec: 0, tx_sec: 0 };
+
+        // Safe bandwidth calculation
         let bandwidthUsage = 0;
-        if (primaryInterface?.speed && mainInterface) {
-            const rxBits = mainInterface.rx_sec * 8;
-            const txBits = mainInterface.tx_sec * 8;
-            const interfaceCapacity = primaryInterface.speed * 1e6; // Convert Mbps to bits/sec
-            bandwidthUsage = Number(((rxBits + txBits) / interfaceCapacity * 100).toFixed(1));
+        try {
+            if (primaryInterface?.speed && mainInterface) {
+                const rxBits = mainInterface.rx_sec * 8;
+                const txBits = mainInterface.tx_sec * 8;
+                const interfaceCapacity = primaryInterface.speed * 1e6;
+                bandwidthUsage = Number(((rxBits + txBits) / interfaceCapacity * 100).toFixed(1));
+            }
+        } catch (err) {
+            console.warn('Bandwidth calculation error:', err);
         }
 
-        // Enhanced speed test with better error handling
+        // Speed test with timeout and error handling
         let speedTestResult = null;
         try {
             speedTestResult = await Promise.race([
-                speedtest.getSpeed(),
+                speedtest.getSpeed().catch(() => null),
                 new Promise(resolve => setTimeout(() => resolve(null), 5000))
             ]);
         } catch (error) {
@@ -128,10 +167,10 @@ const getRealTimeNetworkHealth = async () => {
         const networkHealth = {
             latency: {
                 current: latencyCheck || 0,
-                historicalAverage: 22.4  // Example baseline from monitoring
+                historicalAverage: 22.4
             },
             bandwidth: {
-                usagePercentage: bandwidthUsage,
+                usagePercentage: bandwidthUsage || 0,
                 currentUsage: {
                     upload: mainInterface?.tx_sec || 0,
                     download: mainInterface?.rx_sec || 0
@@ -150,24 +189,32 @@ const getRealTimeNetworkHealth = async () => {
                 isConnected: !!(primaryInterface?.ip4 || primaryInterface?.ip6)
             },
             connections: {
-                ethernet: activeInterfaces.filter(iface => 
-                    (iface.type === 'wired' || 
-                     iface.iface.toLowerCase().includes('eth') ||
-                     iface.iface.toLowerCase().includes('ethernet')) &&
-                    iface.operstate === 'up' &&
-                    (iface.ip4 || iface.ip6)
-                ).length,
-                wifi: activeInterfaces.filter(iface => 
-                    (iface.type === 'wireless' ||
-                     iface.iface.toLowerCase().includes('wlan') ||
-                     iface.iface.toLowerCase().includes('wifi')) &&
-                    iface.operstate === 'up' &&
-                    (iface.ip4 || iface.ip6)
-                ).length
+                ethernet: activeInterfaces.filter(iface => {
+                    try {
+                        return (iface.type === 'wired' || 
+                               iface.iface.toLowerCase().includes('eth') ||
+                               iface.iface.toLowerCase().includes('ethernet')) &&
+                               iface.operstate === 'up' &&
+                               (iface.ip4 || iface.ip6);
+                    } catch (err) {
+                        return false;
+                    }
+                }).length,
+                wifi: activeInterfaces.filter(iface => {
+                    try {
+                        return (iface.type === 'wireless' ||
+                               iface.iface.toLowerCase().includes('wlan') ||
+                               iface.iface.toLowerCase().includes('wifi')) &&
+                               iface.operstate === 'up' &&
+                               (iface.ip4 || iface.ip6);
+                    } catch (err) {
+                        return false;
+                    }
+                }).length
             },
             healthStatus: calculateHealthScore({
-                latency: latencyCheck,
-                bandwidthUsage
+                latency: latencyCheck || 0,
+                bandwidthUsage: bandwidthUsage || 0
             })
         };
 
@@ -175,7 +222,16 @@ const getRealTimeNetworkHealth = async () => {
 
     } catch (error) {
         console.error('Network monitoring error:', error);
-        throw error;
+        // Return a minimal response instead of throwing
+        return {
+            error: 'Network monitoring temporarily unavailable',
+            timestamp: new Date().toISOString(),
+            healthStatus: {
+                score: 0,
+                components: { latency: 0, bandwidth: 0 },
+                label: 'Error'
+            }
+        };
     }
 };
 
