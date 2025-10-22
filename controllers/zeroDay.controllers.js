@@ -286,8 +286,12 @@ class ZeroDayController {
 
     async checkSystemPatches() {
         try {
-            const { stdout } = await execAsync('wmic qfe list brief');
-            return this.parseUpdateHistory(stdout);
+            if (process.platform === 'win32') {
+                const { stdout } = await execAsync('wmic qfe list brief');
+                return this.parseUpdateHistory(stdout);
+            } else {
+                return { message: 'Patch checking is only available on Windows systems' };
+            }
         } catch (error) {
             console.error('Patch check error:', error);
             return { error: 'Could not check system patches' };
@@ -724,12 +728,12 @@ class ZeroDayController {
     // Add these helper methods as well
     async checkAntivirusStatus() {
         try {
-            const { stdout } = await execAsync('powershell Get-MpComputerStatus');
-            return {
-                enabled: stdout.includes('True'),
-                realTimeProtection: stdout.includes('RealTimeProtectionEnabled                : True'),
-                lastUpdateTime: new Date().toISOString()
-            };
+            if (process.platform === 'win32') {
+                const { stdout } = await execAsync('powershell Get-MpComputerStatus');
+                return this.parseDefenderStatus(stdout);
+            } else {
+                return { message: 'Antivirus status checking is only available on Windows systems' };
+            }
         } catch (error) {
             console.error('Antivirus status check error:', error);
             return { error: 'Could not check antivirus status' };
